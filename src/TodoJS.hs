@@ -3,6 +3,9 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE MonadComprehensions #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE DeriveGeneric #-}
 -- | "Todo-JS"
 --
 -- Simple todo app on ghcjs, with logic straight from the non-javascript
@@ -26,47 +29,53 @@
 
 module Main (main) where
 
-import Control.Applicative
+import           Control.Applicative
 import Control.Auto hiding          (All)
-import Control.Auto.Run
-import Control.Concurrent
-import Control.Monad                (unless, when, join)
-import Control.Monad.IO.Class
-import Data.Foldable                (forM_, all)
-import Data.IntMap                  (IntMap)
-import Data.Maybe
-import Data.Serialize
-import GHC.Generics
-import GHCJS.DOM
-import GHCJS.DOM.Document
-import GHCJS.DOM.Element
-import GHCJS.DOM.EventM
-import GHCJS.DOM.HTMLAnchorElement
-import GHCJS.DOM.HTMLButtonElement
-import GHCJS.DOM.HTMLElement
-import GHCJS.DOM.HTMLInputElement
-import GHCJS.DOM.HTMLLabelElement
-import GHCJS.DOM.HTMLLinkElement
-import GHCJS.DOM.HTMLMetaElement
-import GHCJS.DOM.HTMLTitleElement
-import GHCJS.DOM.Node
-import GHCJS.DOM.Types
-import GHCJS.Foreign
+import           Control.Auto.Run
+import           Control.Concurrent
+import           Control.Monad (unless, when, join)
+import           Control.Monad.IO.Class
+import           Data.Foldable (forM_, all)
+import           Data.IntMap (IntMap)
+import           Data.Maybe
+import           Data.Serialize
+import           GHC.Generics
+import           GHCJS.DOM
+import           GHCJS.DOM.Document
+import           GHCJS.DOM.Element
+import           GHCJS.DOM.EventM
+import           GHCJS.DOM.HTMLAnchorElement
+import           GHCJS.DOM.HTMLButtonElement
+import           GHCJS.DOM.HTMLElement
+import           GHCJS.DOM.HTMLInputElement
+import           GHCJS.DOM.HTMLLabelElement
+import           GHCJS.DOM.HTMLLinkElement
+import           GHCJS.DOM.HTMLMetaElement
+import           GHCJS.DOM.HTMLTitleElement
+import           GHCJS.DOM.Node
+import           GHCJS.DOM.Types
+import           GHCJS.Foreign
 
-import Control.Monad.State (MonadState)
-import GHCJS.DOM.Types (GObject, toGObject, unsafeCastGObject)
-import GHCJS.DOM.UIEvent
-import GHCJS.Marshal
-import GHCJS.Types
-import VirtualDom
+import           Control.Lens
+import           Control.Monad.State (MonadState)
+import           Data.List (stripPrefix)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import           GHCJS.DOM.DOMWindow
+import           GHCJS.DOM.Types (GObject, toGObject, unsafeCastGObject)
+import           GHCJS.DOM.UIEvent
+import           GHCJS.Marshal
+import           GHCJS.Types
+import           VirtualDom
 import qualified VirtualDom as VD
-import VirtualDom.Prim (text)
+import           VirtualDom.HTML.Attributes
+import           VirtualDom.Prim (text)
 import qualified VirtualDom.Prim as VDP
-import VirtualDom.HTML.Attributes
-import Control.Lens
+import           Web.Routes
+import qualified Web.Routes.TH as WRTH
 
 import Prelude hiding               ((.), id, all)
-import Todo
+import           Todo
 import qualified Data.IntMap.Strict as IM
 
 data GUIOpts = GUI { _currFilter   :: Filter        -- currently applied filter
@@ -80,6 +89,43 @@ data Filter = All | Active | Completed
             deriving (Show, Generic, Enum, Eq)
 
 instance Serialize Filter
+
+-- routes declaration
+instance PathInfo (Maybe TaskID)
+
+$(WRTH.derivePathInfo ''Filter)
+$(WRTH.derivePathInfo' (\s ->
+                         '#':(WRTH.standard $ fromMaybe s $ stripPrefix "GI" s))
+  ''GUIInp)
+
+guiRoutes :: (Chan (Either TodoInp GUIInp)) -> GUIInp -> RouteT GUIInp IO ()
+guiRoutes chan url =
+    liftIO $ writeChan chan (Right url)
+
+guiUrlPath :: GUIInp -> [(T.Text, Maybe T.Text)] -> JSString
+guiUrlPath url params =
+  toJSString frag
+  where
+    path = toPathInfoParams url params
+    frag = maybe path (T.cons '#') $ T.stripPrefix "/%23" path
+
+guiInitRoutes :: DOMWindow -> (Chan (Either TodoInp GUIInp)) -> IO ()
+guiInitRoutes win inputChan = do
+  let site = mkSitePI $ runRouteT $ guiRoutes inputChan
+  domWindowOnhashchange win $
+    liftIO $ do
+      url <- locationHash
+      _ <- either error id $
+           runSite "" site $ decodePathInfo (TE.encodeUtf8 . fromJSString $ url)
+      return ()
+  return ()
+
+foreign import javascript unsafe
+  "window.location.hash"
+  ffiLocationHash :: IO JSString
+
+locationHash :: IO JSString
+locationHash = ffiLocationHash
 
 -- | A new `Auto` that takes in commands from the GUI (that can either be
 -- commands for the Todo app logic itself, or commands to change some GUI
@@ -113,8 +159,6 @@ todoAppGUI = proc inp -> do
     selcInps :: Either TodoInp GUIInp -> Maybe (Maybe TaskID)
     selcInps etg = [ selc | Right (GISelect selc) <- Just etg ]
 
-
-
 main :: IO ()
 main = do
     initDomDelegator
@@ -124,6 +168,8 @@ main = do
     inputChan <- newChan :: IO (Chan (Either TodoInp GUIInp))
 
     runWebGUI $ \ webView -> do
+      guiInitRoutes webView inputChan
+
       Just doc <- webViewGetDomDocument webView
 
       -- render the skeleton, giving a reference to the todo list and the
@@ -278,12 +324,9 @@ renderVNode body inputChan tasks tasks' (GUI filt selc) allCompleted uncomplCoun
     filters =
       with ul_ (id_ ?= "filters") $
       map (\filtType ->
-            with li_ (on ("click")
-                      (\_ ->
-                        -- send a new command to the queue whenever button is pressed
-                        writeChan inputChan (Right (GIFilter filtType))) >>
-                      href_ ?= "javascript:void();")
-            [with a_ (if (filtType == filt)
+            into li_
+            [with a_ (href_ ?= (guiUrlPath (GIFilter filtType) []) >>
+                      if (filtType == filt)
                       then class_ ?= "selected"
                       else return ())
              [text (show filtType)]
